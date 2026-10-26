@@ -1,0 +1,13 @@
+node_modules
+dist
+.firebase
+*.log
+
+# chei și setări locale: nu se urcă niciodată
+.env
+.env.*
+!.env.example
+
+# versiunea veche și datele de test, care nu trebuie urcate
+public/
+src/mock.jsx

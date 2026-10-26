@@ -1,0 +1,144 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ================= Roluri =================
+    // admin   = tu (emailul de mai jos): aprobi accesul, dai drept de creare, poți șterge orice turneu
+    // creator = membru căruia i-ai dat voie să creeze turnee (nu poate aproba pe alții)
+    // membru  = aprobat de tine: vede tot, se înscrie, votează, își alege porecla
+    // restul  = văd doar pagina de prezentare
+
+    function signedIn() {
+      return request.auth != null;
+    }
+
+    function isAdmin() {
+      return signedIn()
+        && request.auth.token.email_verified == true
+        && request.auth.token.email == "cosminkhaled@gmail.com";
+    }
+
+    function memberDoc() {
+      return /databases/$(database)/documents/members/$(request.auth.uid);
+    }
+
+    function isMember() {
+      return isAdmin() || (signedIn() && exists(memberDoc()));
+    }
+
+    function isCreator() {
+      return isAdmin() || (signedIn() && exists(memberDoc()) && get(memberDoc()).data.get('creator', false) == true);
+    }
+
+    // Turneele vechi (fără ownerUid) îi aparțin adminului.
+    function ownsTournament(t) {
+      return signedIn() && (
+        t.get('ownerUid', null) == request.auth.uid
+        || (isAdmin() && t.get('ownerUid', null) == null)
+      );
+    }
+
+    function tournament(tid) {
+      return get(/databases/$(database)/documents/tournaments/$(tid)).data;
+    }
+
+    // ================= Acces =================
+
+    // Cereri de acces: fiecare își creează cererea lui; doar adminul le gestionează.
+    match /requests/{uid} {
+      allow read: if isAdmin() || (signedIn() && request.auth.uid == uid);
+      allow create: if signedIn()
+        && request.auth.uid == uid
+        && request.resource.data.keys().hasOnly(['name', 'email', 'at'])
+        && request.resource.data.name is string && request.resource.data.name.size() <= 60
+        && request.resource.data.email == request.auth.token.email
+        && request.resource.data.at == request.time;
+      allow update, delete: if isAdmin();
+    }
+
+    // Membrii: doar adminul îi adaugă, le dă drept de creare sau îi scoate.
+    match /members/{uid} {
+      allow read: if isAdmin() || (signedIn() && request.auth.uid == uid);
+      allow write: if isAdmin();
+    }
+
+    // Pagina verifică aici dacă cel logat e adminul (doar el poate citi).
+    match /config/organizer {
+      allow read: if isAdmin();
+      allow write: if false;
+    }
+
+    // ================= Turnee =================
+
+    match /tournaments/{tid} {
+      allow read: if isMember();
+      allow create: if isCreator()
+        && request.resource.data.ownerUid == request.auth.uid
+        && request.resource.data.name is string && request.resource.data.name.size() <= 80;
+      // Doar creatorul turneului îl modifică; nu îl poate trece pe numele altcuiva.
+      allow update: if ownsTournament(resource.data)
+        && request.resource.data.get('ownerUid', null) == resource.data.get('ownerUid', null);
+      // Creatorul sau adminul (pentru moderare) îl pot șterge.
+      allow delete: if ownsTournament(resource.data) || isAdmin();
+    }
+
+    // Înscrieri: membrii se înscriu singuri, cât timp înscrierile sunt deschise.
+    function regOpen(tid) {
+      let t = tournament(tid);
+      return t.get('reg', 'closed') == 'open'
+        && (t.get('deadline', 0) == 0 || request.time.toMillis() < t.get('deadline', 0));
+    }
+    match /tournaments/{tid}/entries/{uid} {
+      allow read: if isMember();
+      allow create, update: if isMember()
+        && request.auth.uid == uid
+        && regOpen(tid)
+        && request.resource.data.keys().hasOnly(['name', 'at'])
+        && request.resource.data.name is string
+        && request.resource.data.name.size() >= 1
+        && request.resource.data.name.size() <= 40;
+      allow delete: if ownsTournament(tournament(tid))
+        || (signedIn() && request.auth.uid == uid && regOpen(tid));
+    }
+
+    // ================= Comunitate =================
+
+    // Porecle: fiecare membru o setează pe a lui; adminul le poate reseta.
+    match /profiles/{uid} {
+      allow read: if isMember();
+      allow create, update: if isMember()
+        && request.auth.uid == uid
+        && request.resource.data.keys().hasOnly(['name'])
+        && request.resource.data.name is string
+        && request.resource.data.name.size() >= 1
+        && request.resource.data.name.size() <= 30;
+      allow delete: if isAdmin();
+    }
+
+    // Pick'em: un document per vot, ora pusă de server, refuzat dacă meciul are deja rezultat.
+    function noResult(tid, mid) {
+      return tournament(tid).get('results', {}).get(mid, null) == null;
+    }
+    match /votes/{vid} {
+      allow read: if isMember();
+      allow create, update: if isMember()
+        && request.resource.data.keys().hasOnly(['uid', 'tid', 'mid', 'p', 'at'])
+        && request.resource.data.uid == request.auth.uid
+        && request.resource.data.tid is string && request.resource.data.tid.size() <= 40
+        && request.resource.data.mid is string && request.resource.data.mid.size() <= 24
+        && request.resource.data.p is string && request.resource.data.p.size() <= 8
+        && vid == request.auth.uid + '_' + request.resource.data.tid + '_' + request.resource.data.mid
+        && request.resource.data.at == request.time
+        && noResult(request.resource.data.tid, request.resource.data.mid);
+      // Adminul (moderare) sau creatorul turneului pot șterge voturi.
+      allow delete: if isAdmin() || ownsTournament(tournament(resource.data.tid));
+    }
+
+    // Voturile din prima versiune: doar citire.
+    match /picks/{uid} {
+      allow read: if isMember();
+      allow create, update: if false;
+      allow delete: if isAdmin();
+    }
+  }
+}
